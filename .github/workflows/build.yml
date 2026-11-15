@@ -117,16 +117,47 @@ jobs:
           cat > app/src/main/java/com/example/nowbridge/LiveNotifier.kt <<'EOF'
           package com.example.nowbridge
 
-          import android.app.*
+          import android.app.Notification
+          import android.app.NotificationChannel
+          import android.app.NotificationManager
+          import android.app.PendingIntent
           import android.content.Context
           import android.content.Intent
+          import android.graphics.Bitmap
+          import android.graphics.Canvas
+          import android.graphics.Color
+          import android.graphics.Paint
+          import android.graphics.PorterDuff
+          import android.graphics.PorterDuffXfermode
+          import android.graphics.Typeface
           import android.graphics.drawable.Icon
           import android.os.Bundle
           import android.service.notification.StatusBarNotification
+          import androidx.core.graphics.drawable.toBitmap
 
           object LiveNotifier {
               private const val CH = "now_bridge_live"
               private val history = HashMap<Int, MutableList<String>>()
+              private val counts = HashMap<Int, Int>()
+
+              private val palette = intArrayOf(
+                  0xFF6C5CE7.toInt(), 0xFF00B4D8.toInt(), 0xFFE84393.toInt(),
+                  0xFF00B894.toInt(), 0xFFFD9644.toInt(), 0xFF0984E3.toInt()
+              )
+              private val brand = mapOf(
+                  "com.whatsapp" to 0xFF25D366.toInt(),
+                  "com.whatsapp.w4b" to 0xFF25D366.toInt(),
+                  "org.telegram.messenger" to 0xFF2AABEE.toInt(),
+                  "org.telegram.messenger.web" to 0xFF2AABEE.toInt(),
+                  "com.zhiliaoapp.musically" to 0xFFFE2C55.toInt(),
+                  "com.ss.android.ugc.trill" to 0xFFFE2C55.toInt(),
+                  "com.instagram.android" to 0xFFE1306C.toInt(),
+                  "com.discord" to 0xFF5865F2.toInt(),
+                  "com.viber.voip" to 0xFF7360F2.toInt(),
+                  "com.vkontakte.android" to 0xFF0077FF.toInt(),
+                  "com.facebook.orca" to 0xFF0084FF.toInt(),
+                  "com.snapchat.android" to 0xFFF2B600.toInt()
+              )
 
               fun ensureChannel(ctx: Context) {
                   val nm = ctx.getSystemService(NotificationManager::class.java)
@@ -135,7 +166,48 @@ jobs:
                   )
               }
 
-              fun clear(id: Int) { history.remove(id) }
+              fun clear(id: Int) { history.remove(id); counts.remove(id) }
+
+              private fun circle(src: Bitmap): Bitmap {
+                  val s = minOf(src.width, src.height)
+                  val out = Bitmap.createBitmap(s, s, Bitmap.Config.ARGB_8888)
+                  val c = Canvas(out)
+                  val p = Paint(Paint.ANTI_ALIAS_FLAG)
+                  c.drawCircle(s / 2f, s / 2f, s / 2f, p)
+                  p.xfermode = PorterDuffXfermode(PorterDuff.Mode.SRC_IN)
+                  c.drawBitmap(src, (s - src.width) / 2f, (s - src.height) / 2f, p)
+                  return out
+              }
+
+              private fun letter(ch: String, color: Int): Bitmap {
+                  val s = 256
+                  val out = Bitmap.createBitmap(s, s, Bitmap.Config.ARGB_8888)
+                  val c = Canvas(out)
+                  val p = Paint(Paint.ANTI_ALIAS_FLAG)
+                  p.color = color
+                  c.drawCircle(s / 2f, s / 2f, s / 2f, p)
+                  p.color = Color.WHITE
+                  p.textSize = 130f
+                  p.textAlign = Paint.Align.CENTER
+                  p.typeface = Typeface.DEFAULT_BOLD
+                  c.drawText(ch, s / 2f, s / 2f - (p.descent() + p.ascent()) / 2f, p)
+                  return out
+              }
+
+              private fun styled(ctx: Context, a: Notification.Action): Notification.Action? {
+                  val reply = (a.remoteInputs?.isNotEmpty() == true) ||
+                      a.semanticAction == Notification.Action.SEMANTIC_ACTION_REPLY
+                  val read = a.semanticAction == Notification.Action.SEMANTIC_ACTION_MARK_AS_READ
+                  if (!reply && !read) return null
+                  val pi = a.actionIntent ?: return null
+                  val icon = if (reply) R.drawable.ic_reply else R.drawable.ic_check
+                  val label = if (reply) "Ответить" else "Прочитано"
+                  val nb = Notification.Action.Builder(Icon.createWithResource(ctx, icon), label, pi)
+                  a.remoteInputs?.forEach { nb.addRemoteInput(it) }
+                  nb.setSemanticAction(a.semanticAction)
+                  nb.setAllowGeneratedReplies(a.allowGeneratedReplies)
+                  return nb.build()
+              }
 
               fun show(ctx: Context, sbn: StatusBarNotification) {
                   val n = sbn.notification
@@ -153,12 +225,24 @@ jobs:
                   val lines = history.getOrPut(id) { mutableListOf() }
                   if (lines.lastOrNull() != text) lines.add(text)
                   while (lines.size > 5) lines.removeAt(0)
+                  val count = (counts[id] ?: 0) + 1
+                  counts[id] = count
+
+                  val color = brand[sbn.packageName] ?: palette[Math.floorMod(title.hashCode(), palette.size)]
+                  val chip = if (count > 1) "${title.take(5)}·$count" else title.take(7)
+                  val sub = if (count > 1) "$app · $count новых" else app
+
+                  val avatar = runCatching {
+                      n.getLargeIcon()?.loadDrawable(ctx)?.toBitmap(256, 256)?.let { circle(it) }
+                  }.getOrNull() ?: letter(title.trim().take(1).uppercase().ifEmpty { "?" }, color)
 
                   val b = Notification.Builder(ctx, CH)
                       .setSmallIcon(R.drawable.ic_bridge)
+                      .setLargeIcon(avatar)
+                      .setColor(color)
                       .setContentTitle(title)
                       .setContentText(text)
-                      .setSubText(app)
+                      .setSubText(sub)
                       .setStyle(Notification.BigTextStyle().bigText(lines.joinToString("\n")))
                       .setOngoing(true)
                       .setAutoCancel(true)
@@ -166,14 +250,14 @@ jobs:
                       .setWhen(System.currentTimeMillis())
                       .setShowWhen(true)
 
-                  n.getLargeIcon()?.let { b.setLargeIcon(it) }
-
                   val tap = n.contentIntent ?: pm.getLaunchIntentForPackage(sbn.packageName)?.let {
                       PendingIntent.getActivity(ctx, id, it, PendingIntent.FLAG_IMMUTABLE)
                   }
                   tap?.let { b.setContentIntent(it) }
 
-                  n.actions?.take(2)?.forEach { b.addAction(it) }
+                  n.actions?.mapNotNull { styled(ctx, it) }
+                      ?.sortedBy { if (it.title.toString() == "Ответить") 0 else 1 }
+                      ?.take(2)?.forEach { b.addAction(it) }
 
                   val dismiss = PendingIntent.getBroadcast(
                       ctx, id,
@@ -181,16 +265,17 @@ jobs:
                       PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
                   )
                   b.addAction(
-                      Notification.Action.Builder(Icon.createWithResource(ctx, R.drawable.ic_bridge), "Закрыть", dismiss).build()
+                      Notification.Action.Builder(Icon.createWithResource(ctx, R.drawable.ic_close), "Закрыть", dismiss).build()
                   )
 
                   b.addExtras(Bundle().apply {
                       putBoolean("android.requestPromotedOngoing", true)
-                      putString("android.shortCriticalText", title.take(7))
+                      putString("android.shortCriticalText", chip)
                       putInt("android.ongoingActivityNoti.style", 1)
                       putString("android.ongoingActivityNoti.primaryInfo", title)
                       putString("android.ongoingActivityNoti.secondaryInfo", text)
-                      putString("android.ongoingActivityNoti.chipExpandedText", title.take(10))
+                      putString("android.ongoingActivityNoti.chipExpandedText", chip)
+                      putInt("android.ongoingActivityNoti.chipBgColor", color)
                       putString("android.ongoingActivityNoti.nowbarPrimaryInfo", title)
                       putString("android.ongoingActivityNoti.nowbarSecondaryInfo", text)
                   })
@@ -406,6 +491,27 @@ jobs:
               android:width="24dp" android:height="24dp" android:viewportWidth="24" android:viewportHeight="24">
               <path android:fillColor="#FFFFFF"
                   android:pathData="M4,4h16a2,2 0,0 1,2 2v9a2,2 0,0 1,-2 2H9l-5,4v-4a2,2 0,0 1,-2 -2V6a2,2 0,0 1,2 -2z" />
+          </vector>
+          EOF
+          cat > app/src/main/res/drawable/ic_close.xml <<'EOF'
+          <vector xmlns:android="http://schemas.android.com/apk/res/android"
+              android:width="24dp" android:height="24dp" android:viewportWidth="24" android:viewportHeight="24">
+              <path android:fillColor="#FFFFFF"
+                  android:pathData="M19,6.41L17.59,5 12,10.59 6.41,5 5,6.41 10.59,12 5,17.59 6.41,19 12,13.41 17.59,19 19,17.59 13.41,12z" />
+          </vector>
+          EOF
+          cat > app/src/main/res/drawable/ic_check.xml <<'EOF'
+          <vector xmlns:android="http://schemas.android.com/apk/res/android"
+              android:width="24dp" android:height="24dp" android:viewportWidth="24" android:viewportHeight="24">
+              <path android:fillColor="#FFFFFF"
+                  android:pathData="M9,16.17L4.83,12l-1.42,1.41L9,19 21,7l-1.41,-1.41z" />
+          </vector>
+          EOF
+          cat > app/src/main/res/drawable/ic_reply.xml <<'EOF'
+          <vector xmlns:android="http://schemas.android.com/apk/res/android"
+              android:width="24dp" android:height="24dp" android:viewportWidth="24" android:viewportHeight="24">
+              <path android:fillColor="#FFFFFF"
+                  android:pathData="M10,9V5l-7,7 7,7v-4.1c5,0 8.5,1.6 11,5.1 -1,-5 -4,-10 -11,-11z" />
           </vector>
           EOF
           mkdir -p app/src/main/res/values
