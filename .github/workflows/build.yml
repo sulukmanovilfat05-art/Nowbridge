@@ -17,6 +17,7 @@ jobs:
       - name: Create project and build
         run: |
           mkdir -p work && cd work
+          printf 'android.useAndroidX=true\norg.gradle.jvmargs=-Xmx3g\n' > gradle.properties
           mkdir -p app
           cat > app/build.gradle.kts <<'EOF'
           plugins {
@@ -101,7 +102,7 @@ jobs:
                       if (remove) cancelNotification(sbn.key)
                       return
                   }
-                  if (sbn.isOngoing) return // звонки, музыка, загрузки не трогаем
+                  if (sbn.isOngoing) return
                   if (n.category == Notification.CATEGORY_CALL || n.category == Notification.CATEGORY_TRANSPORT) return
 
                   LiveNotifier.show(this, sbn)
@@ -113,7 +114,6 @@ jobs:
               }
           }
           EOF
-          mkdir -p app/src/main/java/com/example/nowbridge
           cat > app/src/main/java/com/example/nowbridge/LiveNotifier.kt <<'EOF'
           package com.example.nowbridge
 
@@ -121,7 +121,7 @@ jobs:
           import android.content.Context
           import android.content.Intent
           import android.graphics.drawable.Icon
-          import android.os.Build
+          import android.os.Bundle
           import android.service.notification.StatusBarNotification
 
           object LiveNotifier {
@@ -168,13 +168,11 @@ jobs:
 
                   n.getLargeIcon()?.let { b.setLargeIcon(it) }
 
-                  // Тап = как по обычному уведомлению
                   val tap = n.contentIntent ?: pm.getLaunchIntentForPackage(sbn.packageName)?.let {
                       PendingIntent.getActivity(ctx, id, it, PendingIntent.FLAG_IMMUTABLE)
                   }
                   tap?.let { b.setContentIntent(it) }
 
-                  // Оригинальные действия (Ответить / Прочитано)
                   n.actions?.take(2)?.forEach { b.addAction(it) }
 
                   val dismiss = PendingIntent.getBroadcast(
@@ -186,10 +184,10 @@ jobs:
                       Notification.Action.Builder(Icon.createWithResource(ctx, R.drawable.ic_bridge), "Закрыть", dismiss).build()
                   )
 
-                  if (Build.VERSION.SDK_INT >= 36) {
-                      b.setRequestPromotedOngoing(true)
-                      b.setShortCriticalText(title.take(7))
-                  }
+                  b.addExtras(Bundle().apply {
+                      putBoolean("android.requestPromotedOngoing", true)
+                      putString("android.shortCriticalText", title.take(7))
+                  })
                   ctx.getSystemService(NotificationManager::class.java).notify(id, b.build())
               }
           }
@@ -202,7 +200,6 @@ jobs:
               }
           }
           EOF
-          mkdir -p app/src/main/java/com/example/nowbridge
           cat > app/src/main/java/com/example/nowbridge/MainActivity.kt <<'EOF'
           package com.example.nowbridge
 
@@ -377,7 +374,6 @@ jobs:
               }
           }
           EOF
-          mkdir -p app/src/main/java/com/example/nowbridge
           cat > app/src/main/java/com/example/nowbridge/Prefs.kt <<'EOF'
           package com.example.nowbridge
 
