@@ -1,0 +1,430 @@
+name: Build APK
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: 8.14.3
+      - name: Create project and build
+        run: |
+          mkdir -p work && cd work
+          mkdir -p app
+          cat > app/build.gradle.kts <<'EOF'
+          plugins {
+              id("com.android.application")
+              id("org.jetbrains.kotlin.android")
+              id("org.jetbrains.kotlin.plugin.compose")
+          }
+          android {
+              namespace = "com.example.nowbridge"
+              compileSdk = 36
+              defaultConfig {
+                  applicationId = "com.example.nowbridge"
+                  minSdk = 31; targetSdk = 36
+                  versionCode = 1; versionName = "1.0"
+              }
+              buildFeatures { compose = true }
+              compileOptions { sourceCompatibility = JavaVersion.VERSION_17; targetCompatibility = JavaVersion.VERSION_17 }
+              kotlinOptions { jvmTarget = "17" }
+          }
+          dependencies {
+              implementation("androidx.core:core-ktx:1.16.0")
+              implementation("androidx.activity:activity-compose:1.10.1")
+              implementation("androidx.lifecycle:lifecycle-runtime-compose:2.9.1")
+              implementation(platform("androidx.compose:compose-bom:2025.06.00"))
+              implementation("androidx.compose.ui:ui")
+              implementation("androidx.compose.material3:material3")
+          }
+          EOF
+          mkdir -p app/src/main
+          cat > app/src/main/AndroidManifest.xml <<'EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+              <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+              <uses-permission android:name="android.permission.POST_PROMOTED_NOTIFICATIONS" />
+              <queries>
+                  <intent>
+                      <action android:name="android.intent.action.MAIN" />
+                      <category android:name="android.intent.category.LAUNCHER" />
+                  </intent>
+              </queries>
+              <application
+                  android:icon="@drawable/ic_bridge"
+                  android:label="@string/app_name"
+                  android:theme="@android:style/Theme.Material.NoActionBar">
+                  <activity android:name=".MainActivity" android:exported="true">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+                  <service
+                      android:name=".BridgeListener"
+                      android:exported="true"
+                      android:permission="android.permission.BIND_NOTIFICATION_LISTENER_SERVICE">
+                      <intent-filter>
+                          <action android:name="android.service.notification.NotificationListenerService" />
+                      </intent-filter>
+                  </service>
+                  <receiver android:name=".DismissReceiver" android:exported="false" />
+              </application>
+          </manifest>
+          EOF
+          mkdir -p app/src/main/java/com/example/nowbridge
+          cat > app/src/main/java/com/example/nowbridge/BridgeListener.kt <<'EOF'
+          package com.example.nowbridge
+
+          import android.app.Notification
+          import android.service.notification.NotificationListenerService
+          import android.service.notification.StatusBarNotification
+
+          class BridgeListener : NotificationListenerService() {
+
+              override fun onListenerConnected() { LiveNotifier.ensureChannel(this) }
+
+              override fun onNotificationPosted(sbn: StatusBarNotification) {
+                  if (sbn.packageName == packageName) return
+                  if (sbn.packageName !in Prefs.selected(this)) return
+                  val n = sbn.notification
+                  val remove = Prefs.removeOriginal(this)
+
+                  if (n.flags and Notification.FLAG_GROUP_SUMMARY != 0) {
+                      if (remove) cancelNotification(sbn.key)
+                      return
+                  }
+                  if (sbn.isOngoing) return // звонки, музыка, загрузки не трогаем
+                  if (n.category == Notification.CATEGORY_CALL || n.category == Notification.CATEGORY_TRANSPORT) return
+
+                  LiveNotifier.show(this, sbn)
+                  if (remove) cancelNotification(sbn.key)
+              }
+
+              override fun onNotificationRemoved(sbn: StatusBarNotification) {
+                  if (sbn.packageName == packageName) LiveNotifier.clear(sbn.id)
+              }
+          }
+          EOF
+          mkdir -p app/src/main/java/com/example/nowbridge
+          cat > app/src/main/java/com/example/nowbridge/LiveNotifier.kt <<'EOF'
+          package com.example.nowbridge
+
+          import android.app.*
+          import android.content.Context
+          import android.content.Intent
+          import android.graphics.drawable.Icon
+          import android.os.Build
+          import android.service.notification.StatusBarNotification
+
+          object LiveNotifier {
+              private const val CH = "now_bridge_live"
+              private val history = HashMap<Int, MutableList<String>>()
+
+              fun ensureChannel(ctx: Context) {
+                  val nm = ctx.getSystemService(NotificationManager::class.java)
+                  nm.createNotificationChannel(
+                      NotificationChannel(CH, "Now Bar", NotificationManager.IMPORTANCE_DEFAULT)
+                  )
+              }
+
+              fun clear(id: Int) { history.remove(id) }
+
+              fun show(ctx: Context, sbn: StatusBarNotification) {
+                  val n = sbn.notification
+                  val e = n.extras
+                  val pm = ctx.packageManager
+                  val app = runCatching { pm.getApplicationLabel(pm.getApplicationInfo(sbn.packageName, 0)).toString() }
+                      .getOrDefault(sbn.packageName)
+
+                  val title = (e.getCharSequence(Notification.EXTRA_CONVERSATION_TITLE)
+                      ?: e.getCharSequence(Notification.EXTRA_TITLE) ?: app).toString()
+                  val text = (e.getCharSequence(Notification.EXTRA_BIG_TEXT)
+                      ?: e.getCharSequence(Notification.EXTRA_TEXT) ?: return).toString()
+
+                  val id = "${sbn.packageName}|$title".hashCode()
+                  val lines = history.getOrPut(id) { mutableListOf() }
+                  if (lines.lastOrNull() != text) lines.add(text)
+                  while (lines.size > 5) lines.removeAt(0)
+
+                  val b = Notification.Builder(ctx, CH)
+                      .setSmallIcon(R.drawable.ic_bridge)
+                      .setContentTitle(title)
+                      .setContentText(text)
+                      .setSubText(app)
+                      .setStyle(Notification.BigTextStyle().bigText(lines.joinToString("\n")))
+                      .setOngoing(true)
+                      .setAutoCancel(true)
+                      .setOnlyAlertOnce(false)
+                      .setWhen(System.currentTimeMillis())
+                      .setShowWhen(true)
+
+                  n.getLargeIcon()?.let { b.setLargeIcon(it) }
+
+                  // Тап = как по обычному уведомлению
+                  val tap = n.contentIntent ?: pm.getLaunchIntentForPackage(sbn.packageName)?.let {
+                      PendingIntent.getActivity(ctx, id, it, PendingIntent.FLAG_IMMUTABLE)
+                  }
+                  tap?.let { b.setContentIntent(it) }
+
+                  // Оригинальные действия (Ответить / Прочитано)
+                  n.actions?.take(2)?.forEach { b.addAction(it) }
+
+                  val dismiss = PendingIntent.getBroadcast(
+                      ctx, id,
+                      Intent(ctx, DismissReceiver::class.java).putExtra("id", id),
+                      PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
+                  )
+                  b.addAction(
+                      Notification.Action.Builder(Icon.createWithResource(ctx, R.drawable.ic_bridge), "Закрыть", dismiss).build()
+                  )
+
+                  if (Build.VERSION.SDK_INT >= 36) {
+                      b.setRequestPromotedOngoing(true)
+                      b.setShortCriticalText(title.take(7))
+                  }
+                  ctx.getSystemService(NotificationManager::class.java).notify(id, b.build())
+              }
+          }
+
+          class DismissReceiver : android.content.BroadcastReceiver() {
+              override fun onReceive(ctx: Context, i: Intent) {
+                  val id = i.getIntExtra("id", 0)
+                  ctx.getSystemService(NotificationManager::class.java).cancel(id)
+                  LiveNotifier.clear(id)
+              }
+          }
+          EOF
+          mkdir -p app/src/main/java/com/example/nowbridge
+          cat > app/src/main/java/com/example/nowbridge/MainActivity.kt <<'EOF'
+          package com.example.nowbridge
+
+          import android.Manifest
+          import android.content.Intent
+          import android.graphics.drawable.Drawable
+          import android.os.Bundle
+          import android.provider.Settings
+          import androidx.activity.ComponentActivity
+          import androidx.activity.compose.rememberLauncherForActivityResult
+          import androidx.activity.compose.setContent
+          import androidx.activity.enableEdgeToEdge
+          import androidx.activity.result.contract.ActivityResultContracts
+          import androidx.compose.foundation.Image
+          import androidx.compose.foundation.background
+          import androidx.compose.foundation.border
+          import androidx.compose.foundation.layout.*
+          import androidx.compose.foundation.lazy.LazyColumn
+          import androidx.compose.foundation.lazy.items
+          import androidx.compose.foundation.shape.CircleShape
+          import androidx.compose.foundation.shape.RoundedCornerShape
+          import androidx.compose.material3.*
+          import androidx.compose.runtime.*
+          import androidx.compose.ui.Alignment
+          import androidx.compose.ui.Modifier
+          import androidx.compose.ui.draw.blur
+          import androidx.compose.ui.draw.clip
+          import androidx.compose.ui.graphics.Brush
+          import androidx.compose.ui.graphics.Color
+          import androidx.compose.ui.graphics.asImageBitmap
+          import androidx.compose.ui.platform.LocalContext
+          import androidx.compose.ui.unit.dp
+          import androidx.core.app.NotificationManagerCompat
+          import androidx.core.graphics.drawable.toBitmap
+          import androidx.lifecycle.Lifecycle
+          import androidx.lifecycle.compose.LifecycleEventEffect
+          import kotlinx.coroutines.Dispatchers
+          import kotlinx.coroutines.withContext
+
+          class MainActivity : ComponentActivity() {
+              override fun onCreate(savedInstanceState: Bundle?) {
+                  super.onCreate(savedInstanceState)
+                  enableEdgeToEdge()
+                  LiveNotifier.ensureChannel(this)
+                  setContent { MaterialTheme(colorScheme = darkColorScheme()) { Screen() } }
+              }
+          }
+
+          data class AppItem(val pkg: String, val label: String, val icon: Drawable)
+
+          private val GlassShape = RoundedCornerShape(24.dp)
+
+          @Composable
+          fun Glass(modifier: Modifier = Modifier, content: @Composable ColumnScope.() -> Unit) {
+              Column(
+                  modifier
+                      .clip(GlassShape)
+                      .background(Color.White.copy(alpha = 0.09f))
+                      .border(1.dp, Color.White.copy(alpha = 0.18f), GlassShape)
+                      .padding(16.dp),
+                  content = content
+              )
+          }
+
+          @Composable
+          fun Screen() {
+              val ctx = LocalContext.current
+              var apps by remember { mutableStateOf<List<AppItem>>(emptyList()) }
+              var selected by remember { mutableStateOf(Prefs.selected(ctx)) }
+              var removeOrig by remember { mutableStateOf(Prefs.removeOriginal(ctx)) }
+              var query by remember { mutableStateOf("") }
+              var tick by remember { mutableIntStateOf(0) }
+              LifecycleEventEffect(Lifecycle.Event.ON_RESUME) { tick++ }
+
+              val listenerOn = remember(tick) { NotificationManagerCompat.getEnabledListenerPackages(ctx).contains(ctx.packageName) }
+              val notifOn = remember(tick) { NotificationManagerCompat.from(ctx).areNotificationsEnabled() }
+              val permLauncher = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { tick++ }
+
+              LaunchedEffect(Unit) {
+                  apps = withContext(Dispatchers.IO) {
+                      val pm = ctx.packageManager
+                      val i = Intent(Intent.ACTION_MAIN).addCategory(Intent.CATEGORY_LAUNCHER)
+                      pm.queryIntentActivities(i, 0)
+                          .map { AppItem(it.activityInfo.packageName, it.loadLabel(pm).toString(), it.loadIcon(pm)) }
+                          .filter { it.pkg != ctx.packageName }
+                          .distinctBy { it.pkg }
+                          .sortedBy { it.label.lowercase() }
+                  }
+              }
+
+              fun save(s: Set<String>) { selected = s; Prefs.saveSelected(ctx, s) }
+
+              Box(
+                  Modifier.fillMaxSize().background(
+                      Brush.verticalGradient(listOf(Color(0xFF0B0F1E), Color(0xFF151A33)))
+                  )
+              ) {
+                  Box(Modifier.offset((-80).dp, (-40).dp).size(280.dp).background(Color(0xFF6C5CE7), CircleShape).blur(100.dp))
+                  Box(Modifier.align(Alignment.CenterEnd).offset(90.dp, 120.dp).size(260.dp).background(Color(0xFF00B4D8), CircleShape).blur(110.dp))
+                  Box(Modifier.align(Alignment.BottomStart).offset((-60).dp, 40.dp).size(240.dp).background(Color(0xFFE84393), CircleShape).blur(110.dp))
+
+                  LazyColumn(
+                      Modifier.fillMaxSize().statusBarsPadding().navigationBarsPadding(),
+                      contentPadding = PaddingValues(16.dp),
+                      verticalArrangement = Arrangement.spacedBy(12.dp)
+                  ) {
+                      item {
+                          Text("Now Bridge", style = MaterialTheme.typography.headlineLarge, color = Color.White)
+                          Text("Сообщения из выбранных приложений — в Now Bar", color = Color.White.copy(0.7f))
+                      }
+                      item {
+                          Glass(Modifier.fillMaxWidth()) {
+                              StatusRow("Доступ к уведомлениям", listenerOn) {
+                                  ctx.startActivity(Intent(Settings.ACTION_NOTIFICATION_LISTENER_SETTINGS))
+                              }
+                              Spacer(Modifier.height(8.dp))
+                              StatusRow("Показ уведомлений", notifOn) {
+                                  permLauncher.launch(Manifest.permission.POST_NOTIFICATIONS)
+                              }
+                              Spacer(Modifier.height(8.dp))
+                              Text(
+                                  "Затем: Настройки → Экран блокировки → Now Bar → Живые уведомления → включить Now Bridge",
+                                  color = Color.White.copy(0.6f), style = MaterialTheme.typography.bodySmall
+                              )
+                          }
+                      }
+                      item {
+                          Glass(Modifier.fillMaxWidth()) {
+                              Row(verticalAlignment = Alignment.CenterVertically) {
+                                  Text("Удалять обычные уведомления", Modifier.weight(1f), color = Color.White)
+                                  Switch(removeOrig, { removeOrig = it; Prefs.setRemoveOriginal(ctx, it) })
+                              }
+                              Spacer(Modifier.height(8.dp))
+                              TextButton(onClick = {
+                                  save(selected + apps.map { it.pkg }.filter { it in Prefs.popular })
+                              }) { Text("Выбрать популярные мессенджеры") }
+                              TextButton(onClick = { save(apps.map { it.pkg }.toSet()) }) { Text("Выбрать все приложения") }
+                              TextButton(onClick = { save(emptySet()) }) { Text("Снять всё") }
+                          }
+                      }
+                      item {
+                          OutlinedTextField(
+                              value = query, onValueChange = { query = it },
+                              placeholder = { Text("Поиск приложения") },
+                              singleLine = true, modifier = Modifier.fillMaxWidth(),
+                              shape = GlassShape
+                          )
+                      }
+                      items(apps.filter { query.isBlank() || it.label.contains(query, true) }, key = { it.pkg }) { app ->
+                          Glass(Modifier.fillMaxWidth()) {
+                              Row(verticalAlignment = Alignment.CenterVertically) {
+                                  val bmp = remember(app.pkg) { app.icon.toBitmap(96, 96).asImageBitmap() }
+                                  Image(bmp, null, Modifier.size(40.dp))
+                                  Spacer(Modifier.width(12.dp))
+                                  Text(app.label, Modifier.weight(1f), color = Color.White)
+                                  Switch(app.pkg in selected, {
+                                      save(if (it) selected + app.pkg else selected - app.pkg)
+                                  })
+                              }
+                          }
+                      }
+                  }
+              }
+          }
+
+          @Composable
+          fun StatusRow(label: String, ok: Boolean, onFix: () -> Unit) {
+              Row(verticalAlignment = Alignment.CenterVertically) {
+                  Text((if (ok) "✓ " else "✗ ") + label, Modifier.weight(1f),
+                      color = if (ok) Color(0xFF55EFC4) else Color(0xFFFF7675))
+                  if (!ok) Button(onClick = onFix) { Text("Включить") }
+              }
+          }
+          EOF
+          mkdir -p app/src/main/java/com/example/nowbridge
+          cat > app/src/main/java/com/example/nowbridge/Prefs.kt <<'EOF'
+          package com.example.nowbridge
+
+          import android.content.Context
+
+          object Prefs {
+              val popular = setOf(
+                  "com.whatsapp", "com.whatsapp.w4b", "org.telegram.messenger", "org.telegram.messenger.web",
+                  "com.zhiliaoapp.musically", "com.ss.android.ugc.trill", "com.instagram.android",
+                  "com.discord", "com.viber.voip", "com.facebook.orca", "com.snapchat.android",
+                  "org.thoughtcrime.securesms", "com.vkontakte.android", "com.google.android.apps.messaging",
+                  "com.samsung.android.messaging"
+              )
+              private fun sp(c: Context) = c.getSharedPreferences("prefs", Context.MODE_PRIVATE)
+              fun selected(c: Context): Set<String> = sp(c).getStringSet("sel", emptySet())!!.toSet()
+              fun saveSelected(c: Context, s: Set<String>) = sp(c).edit().putStringSet("sel", s).apply()
+              fun removeOriginal(c: Context) = sp(c).getBoolean("rm", true)
+              fun setRemoveOriginal(c: Context, v: Boolean) = sp(c).edit().putBoolean("rm", v).apply()
+          }
+          EOF
+          mkdir -p app/src/main/res/drawable
+          cat > app/src/main/res/drawable/ic_bridge.xml <<'EOF'
+          <vector xmlns:android="http://schemas.android.com/apk/res/android"
+              android:width="24dp" android:height="24dp" android:viewportWidth="24" android:viewportHeight="24">
+              <path android:fillColor="#FFFFFF"
+                  android:pathData="M4,4h16a2,2 0,0 1,2 2v9a2,2 0,0 1,-2 2H9l-5,4v-4a2,2 0,0 1,-2 -2V6a2,2 0,0 1,2 -2z" />
+          </vector>
+          EOF
+          mkdir -p app/src/main/res/values
+          cat > app/src/main/res/values/strings.xml <<'EOF'
+          <resources><string name="app_name">Now Bridge</string></resources>
+          EOF
+          cat > build.gradle.kts <<'EOF'
+          plugins {
+              id("com.android.application") version "8.11.1" apply false
+              id("org.jetbrains.kotlin.android") version "2.1.21" apply false
+              id("org.jetbrains.kotlin.plugin.compose") version "2.1.21" apply false
+          }
+          EOF
+          cat > settings.gradle.kts <<'EOF'
+          pluginManagement { repositories { google(); mavenCentral(); gradlePluginPortal() } }
+          dependencyResolutionManagement { repositories { google(); mavenCentral() } }
+          rootProject.name = "NowBridge"
+          include(":app")
+          EOF
+          gradle assembleDebug --no-daemon
+      - uses: actions/upload-artifact@v4
+        with:
+          name: NowBridge-apk
+          path: work/app/build/outputs/apk/debug/app-debug.apk
