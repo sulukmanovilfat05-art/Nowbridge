@@ -29,7 +29,7 @@ jobs:
               namespace = "com.example.nowbridge"
               compileSdk = 36
               defaultConfig {
-                  applicationId = "com.example.nowbridge"
+                  applicationId = "com.locnall.KimGiSa"
                   minSdk = 31; targetSdk = 36
                   versionCode = 1; versionName = "1.0"
               }
@@ -187,6 +187,12 @@ jobs:
                   b.addExtras(Bundle().apply {
                       putBoolean("android.requestPromotedOngoing", true)
                       putString("android.shortCriticalText", title.take(7))
+                      putInt("android.ongoingActivityNoti.style", 1)
+                      putString("android.ongoingActivityNoti.primaryInfo", title)
+                      putString("android.ongoingActivityNoti.secondaryInfo", text)
+                      putString("android.ongoingActivityNoti.chipExpandedText", title.take(10))
+                      putString("android.ongoingActivityNoti.nowbarPrimaryInfo", title)
+                      putString("android.ongoingActivityNoti.nowbarSecondaryInfo", text)
                   })
                   ctx.getSystemService(NotificationManager::class.java).notify(id, b.build())
               }
