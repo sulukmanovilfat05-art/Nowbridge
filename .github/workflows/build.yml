@@ -147,4 +147,145 @@ jobs:
               private val brand = mapOf(
                   "com.whatsapp" to 0xFF25D366.toInt(),
                   "com.whatsapp.w4b" to 0xFF25D366.toInt(),
-                  "org.telegram.messenger" to 0xFF2AABEE
+                  "org.telegram.messenger" to 0xFF2AABEE.toInt(),
+                  "org.telegram.messenger.web" to 0xFF2AABEE.toInt(),
+                  "com.zhiliaoapp.musically" to 0xFFFE2C55.toInt(),
+                  "com.ss.android.ugc.trill" to 0xFFFE2C55.toInt(),
+                  "com.instagram.android" to 0xFFE1306C.toInt(),
+                  "com.discord" to 0xFF5865F2.toInt(),
+                  "com.viber.voip" to 0xFF7360F2.toInt(),
+                  "com.vkontakte.android" to 0xFF0077FF.toInt(),
+                  "com.facebook.orca" to 0xFF0084FF.toInt(),
+                  "com.snapchat.android" to 0xFFF2B600.toInt()
+              )
+
+              fun ensureChannel(ctx: Context) {
+                  val nm = ctx.getSystemService(NotificationManager::class.java)
+                  nm.createNotificationChannel(
+                      NotificationChannel(CH, "Now Bar", NotificationManager.IMPORTANCE_DEFAULT)
+                  )
+              }
+
+              fun clear(id: Int) { history.remove(id); counts.remove(id) }
+
+              private fun circle(src: Bitmap): Bitmap {
+                  val s = minOf(src.width, src.height)
+                  val out = Bitmap.createBitmap(s, s, Bitmap.Config.ARGB_8888)
+                  val c = Canvas(out)
+                  val p = Paint(Paint.ANTI_ALIAS_FLAG)
+                  c.drawCircle(s / 2f, s / 2f, s / 2f, p)
+                  p.xfermode = PorterDuffXfermode(PorterDuff.Mode.SRC_IN)
+                  c.drawBitmap(src, (s - src.width) / 2f, (s - src.height) / 2f, p)
+                  return out
+              }
+
+              private fun letter(ch: String, color: Int): Bitmap {
+                  val s = 256
+                  val out = Bitmap.createBitmap(s, s, Bitmap.Config.ARGB_8888)
+                  val c = Canvas(out)
+                  val p = Paint(Paint.ANTI_ALIAS_FLAG)
+                  p.color = color
+                  c.drawCircle(s / 2f, s / 2f, s / 2f, p)
+                  p.color = Color.WHITE
+                  p.textSize = 130f
+                  p.textAlign = Paint.Align.CENTER
+                  p.typeface = Typeface.DEFAULT_BOLD
+                  c.drawText(ch, s / 2f, s / 2f - (p.descent() + p.ascent()) / 2f, p)
+                  return out
+              }
+
+              private fun styled(ctx: Context, a: Notification.Action): Notification.Action? {
+                  val reply = (a.remoteInputs?.isNotEmpty() == true) ||
+                      a.semanticAction == Notification.Action.SEMANTIC_ACTION_REPLY
+                  val read = a.semanticAction == Notification.Action.SEMANTIC_ACTION_MARK_AS_READ
+                  if (!reply && !read) return null
+                  val pi = a.actionIntent ?: return null
+                  val icon = if (reply) R.drawable.ic_reply else R.drawable.ic_check
+                  val label = if (reply) "Ответить" else "Прочитано"
+                  val nb = Notification.Action.Builder(Icon.createWithResource(ctx, icon), label, pi)
+                  a.remoteInputs?.forEach { nb.addRemoteInput(it) }
+                  nb.setSemanticAction(a.semanticAction)
+                  nb.setAllowGeneratedReplies(a.allowGeneratedReplies)
+                  return nb.build()
+              }
+
+              fun show(ctx: Context, sbn: StatusBarNotification) {
+                  val n = sbn.notification
+                  val e = n.extras
+                  val pm = ctx.packageManager
+                  val app = runCatching { pm.getApplicationLabel(pm.getApplicationInfo(sbn.packageName, 0)).toString() }
+                      .getOrDefault(sbn.packageName)
+
+                  val title = (e.getCharSequence(Notification.EXTRA_CONVERSATION_TITLE)
+                      ?: e.getCharSequence(Notification.EXTRA_TITLE) ?: app).toString()
+                  val text = (e.getCharSequence(Notification.EXTRA_BIG_TEXT)
+                      ?: e.getCharSequence(Notification.EXTRA_TEXT) ?: return).toString()
+
+                  val id = "${sbn.packageName}|$title".hashCode()
+                  val lines = history.getOrPut(id) { mutableListOf() }
+                  if (lines.lastOrNull() != text) lines.add(text)
+                  while (lines.size > 5) lines.removeAt(0)
+                  val count = (counts[id] ?: 0) + 1
+                  counts[id] = count
+
+                  val color = brand[sbn.packageName] ?: palette[Math.floorMod(title.hashCode(), palette.size)]
+                  val chip = if (count > 1) "${title.take(5)}·$count" else title.take(7)
+                  val sub = if (count > 1) "$app · $count новых" else app
+
+                  val appBmp = runCatching { circle(pm.getApplicationIcon(sbn.packageName).toBitmap(256, 256)) }.getOrNull()
+                      ?: letter(app.take(1).uppercase().ifEmpty { "?" }, color)
+                  val smallIcon = Icon.createWithBitmap(appBmp)
+
+                  val b = Notification.Builder(ctx, CH)
+                      .setSmallIcon(smallIcon)
+                      .setLargeIcon(appBmp)
+                      .setColor(color)
+                      .setContentTitle(title)
+                      .setContentText(text)
+                      .setSubText(sub)
+                      .setStyle(Notification.BigTextStyle().bigText(lines.joinToString("\n")))
+                      .setOngoing(true)
+                      .setAutoCancel(true)
+                      .setOnlyAlertOnce(false)
+                      .setWhen(System.currentTimeMillis())
+                      .setShowWhen(true)
+
+                  val tap = n.contentIntent ?: pm.getLaunchIntentForPackage(sbn.packageName)?.let {
+                      PendingIntent.getActivity(ctx, id, it, PendingIntent.FLAG_IMMUTABLE)
+                  }
+                  tap?.let { b.setContentIntent(it) }
+
+                  n.actions?.mapNotNull { styled(ctx, it) }
+                      ?.sortedBy { if (it.title.toString() == "Ответить") 0 else 1 }
+                      ?.take(2)?.forEach { b.addAction(it) }
+
+                  val dismiss = PendingIntent.getBroadcast(
+                      ctx, id,
+                      Intent(ctx, DismissReceiver::class.java).putExtra("id", id),
+                      PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
+                  )
+                  b.addAction(
+                      Notification.Action.Builder(Icon.createWithResource(ctx, R.drawable.ic_close), "Закрыть", dismiss).build()
+                  )
+
+                  b.addExtras(Bundle().apply {
+                      putBoolean("android.requestPromotedOngoing", true)
+                      putString("android.shortCriticalText", chip)
+                      putInt("android.ongoingActivityNoti.style", 1)
+                      putString("android.ongoingActivityNoti.primaryInfo", title)
+                      putString("android.ongoingActivityNoti.secondaryInfo", text)
+                      putString("android.ongoingActivityNoti.chipExpandedText", chip)
+                      putInt("android.ongoingActivityNoti.chipBgColor", color)
+                      putParcelable("android.ongoingActivityNoti.chipIcon", Icon.createWithBitmap(appBmp))
+                      putParcelable("android.ongoingActivityNoti.secondaryInfoIcon", Icon.createWithBitmap(appBmp))
+                      putString("android.ongoingActivityNoti.nowbarPrimaryInfo", title)
+                      putString("android.ongoingActivityNoti.nowbarSecondaryInfo", text)
+                  })
+                  ctx.getSystemService(NotificationManager::class.java).notify(id, b.build())
+              }
+          }
+
+          class DismissReceiver : android.content.BroadcastReceiver() {
+              override fun onReceive(ctx: Context, i: Intent) {
+                  val id = i.getIntExtra("id", 0)
+                  ctx.getSystemService(NotificationManager::class.java).cancel(id)
